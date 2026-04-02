@@ -1,9 +1,12 @@
 import Anthropic from '@anthropic-ai/sdk'
+import type { Usage } from '@anthropic-ai/sdk/resources/messages.mjs'
+import { Summarizer } from './summarizer.js'
+import { CostTracker, type ModelUsage } from './cost-tracker.js'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface Message {
-  role: 'user' | 'assistant'
+  role: 'user' | 'assistant' | 'system'
   content: string
 }
 
@@ -19,18 +22,59 @@ interface AskOptions {
   context?: SystemPromptContext
 }
 
+interface ModelUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  costUSD: number
+}
+
+interface ContextWindow {
+  total: number
+  used: number
+  remaining: number
+  usedPercentage: number
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// Cost control limits (inspired by Claude Code patterns)
+const MAX_MESSAGES = 4 // 2 turns (user + assistant pairs)
+const CONTEXT_WINDOW_DEFAULT = 200_000 // 200k tokens
+const MAX_OUTPUT_TOKENS = 8_000 // Conservative start (escalate if needed)
+
+// Pricing (USD per million tokens) — Claude 4.6 models
+const PRICING = {
+  'claude-sonnet-4-6': {
+    input: 3.0 / 1_000_000,
+    output: 15.0 / 1_000_000,
+    cacheRead: 0.3 / 1_000_000, // 10% of input
+    cacheWrite: 3.75 / 1_000_000, // 125% of input
+  },
+  'claude-haiku-4-6': {
+    input: 0.8 / 1_000_000,
+    output: 4.0 / 1_000_000,
+    cacheRead: 0.08 / 1_000_000,
+    cacheWrite: 1.0 / 1_000_000,
+  },
+}
+
 // ─── Engine ───────────────────────────────────────────────────────────────────
 
 export class ClaudeEngine {
   private client: Anthropic
+  private summarizer: Summarizer
+  private costTracker: CostTracker
   private history: Message[] = []
+  private summary: Message | null = null // Compressed history
   private model: string
-  private maxHistory: number
 
-  constructor(model = 'claude-sonnet-4-6', maxHistory = 6) {
+  constructor(model = 'claude-sonnet-4-6') {
     this.client = new Anthropic()
+    this.summarizer = new Summarizer() // Use Haiku for cheap summaries
+    this.costTracker = new CostTracker()
     this.model = model
-    this.maxHistory = maxHistory // 3 turns (user + assistant pairs)
   }
 
   // Inspired by getSystemPrompt() in constants/prompts.ts
@@ -38,12 +82,8 @@ export class ClaudeEngine {
   buildSystemPrompt(ctx: SystemPromptContext): string {
     return [
       `You are ${ctx.role}.`,
-      ctx.constraints
-        ? `## Constraints\n${ctx.constraints}`
-        : null,
-      ctx.rules
-        ? `## Rules\n${ctx.rules}`
-        : null,
+      ctx.constraints ? `## Constraints\n${ctx.constraints}` : null,
+      ctx.rules ? `## Rules\n${ctx.rules}` : null,
       `## Output\nLead with the answer or action — not the reasoning.\nUse \`file:line\` format for code references.\nBe concise. No trailing summaries.`,
     ]
       .filter(Boolean)
@@ -59,16 +99,23 @@ export class ClaudeEngine {
 
     this.history.push({ role: 'user', content: userMessage })
 
-    // Trim history: keep last N messages (sliding window like Claude Code)
-    if (this.history.length > this.maxHistory) {
-      this.history = this.history.slice(-this.maxHistory)
+    // Cost control: sliding window + compression
+    // Pattern from context.ts + compact/prompt.ts
+    if (this.history.length > MAX_MESSAGES) {
+      await this.compressHistory()
     }
+
+    // Build messages: summary (if exists) + recent history
+    const messages = [
+      ...(this.summary ? [this.summary] : []),
+      ...this.history,
+    ]
 
     const response = await this.client.messages.create({
       model: this.model,
-      max_tokens: 8096,
+      max_tokens: MAX_OUTPUT_TOKENS,
       system: systemPrompt,
-      messages: this.history,
+      messages: messages as Anthropic.MessageParam[],
     })
 
     const text =
@@ -76,15 +123,85 @@ export class ClaudeEngine {
 
     this.history.push({ role: 'assistant', content: text })
 
+    // Track cost (pattern from cost-tracker.ts)
+    this.costTracker.track(response.usage, this.model)
+
     return text
+  }
+
+  private async compressHistory(): Promise<void> {
+    // Pattern from compact/prompt.ts: compress old messages into summary
+    if (this.history.length > MAX_MESSAGES) {
+      const toCompress = this.history.slice(0, -MAX_MESSAGES)
+      this.history = this.history.slice(-MAX_MESSAGES)
+
+      console.log(
+        `[Cost Control] Compressing ${toCompress.length} messages...`,
+      )
+
+      // Use Haiku (cheap) to summarize
+      const summaryText = await this.summarizer.summarize(toCompress)
+
+      // Replace old summary with new one (includes old + newly compressed)
+      this.summary = {
+        role: 'user',
+        content: `This session is being continued from a previous conversation. The summary below covers the earlier portion.
+
+${summaryText}
+
+Recent messages are preserved verbatim.`,
+      }
+
+      console.log(`[Cost Control] ✓ Compressed to ${this.summary.content.length} chars`)
+    }
+  }
+
+  getUsage(): ModelUsage | undefined {
+    return this.costTracker.getUsage(this.model)
+  }
+
+  getTotalCost(): number {
+    return this.costTracker.getTotalCost()
+  }
+
+  getContextWindow(): ContextWindow {
+    // Estimate tokens (rough: ~4 chars per token)
+    const estimateTokens = (text: string) => Math.ceil(text.length / 4)
+
+    let used = 0
+    if (this.summary) {
+      used += estimateTokens(this.summary.content)
+    }
+    for (const msg of this.history) {
+      used += estimateTokens(msg.content)
+    }
+
+    const usedPercentage = Math.round((used / CONTEXT_WINDOW_DEFAULT) * 100)
+
+    return {
+      total: CONTEXT_WINDOW_DEFAULT,
+      used,
+      remaining: CONTEXT_WINDOW_DEFAULT - used,
+      usedPercentage: Math.min(100, Math.max(0, usedPercentage)),
+    }
+  }
+
+  formatCostSummary(): string {
+    return this.costTracker.formatSummary()
   }
 
   clearMemory(): void {
     this.history = []
+    this.summary = null
+    this.costTracker.reset()
   }
 
   getHistory(): Message[] {
     return [...this.history]
+  }
+
+  getSummary(): Message | null {
+    return this.summary ? { ...this.summary } : null
   }
 }
 
@@ -133,21 +250,35 @@ Format:
 async function main() {
   const engine = new ClaudeEngine()
 
-  // Workflow: build feature
+  console.log('=== Building Feature ===')
   const featureResult = await engine.ask(
     'Add a `createdAt` timestamp field to the User model in Prisma.',
     { systemPrompt: SYSTEM_PROMPTS.buildFeature },
   )
   console.log(featureResult)
+  console.log('\n' + engine.formatCostSummary())
 
-  engine.clearMemory()
-
-  // Workflow: debug
+  console.log('\n=== Debugging ===')
   const debugResult = await engine.ask(
     'TypeError: Cannot read properties of undefined (reading "id") at getUserById line 42.',
     { systemPrompt: SYSTEM_PROMPTS.debug },
   )
   console.log(debugResult)
+  console.log('\n' + engine.formatCostSummary())
+
+  // Test cost control with many messages
+  console.log('\n=== Testing Cost Control (10 messages) ===')
+  for (let i = 1; i <= 10; i++) {
+    await engine.ask(`Message ${i}: What's 2+2?`)
+    const ctx = engine.getContextWindow()
+    const usage = engine.getUsage()
+    console.log(
+      `[${i}] Context: ${ctx.usedPercentage}% | Cost: $${usage ? usage.costUSD.toFixed(4) : '0.0000'}`,
+    )
+  }
+  
+  console.log('\n' + engine.formatCostSummary())
 }
 
-main().catch(console.error)
+// Uncomment to run:
+// main().catch(console.error)
